@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+elysium_data.db
+elysium_memory/
+user_profiles/
+voice_*
+temp_*
+venv/
