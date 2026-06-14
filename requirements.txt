@@ -10,7 +10,6 @@ Pillow==11.2.1
 fastapi==0.109.0
 uvicorn==0.27.0
 python-dotenv==1.0.1
-groq
 python-telegram-bot>=20.0
 python-dotenv
 aiohttp
@@ -23,3 +22,4 @@ openpyxl
 duckduckgo-search
 faster-whisper
 openai-whisper
+numpy>=1.24.0,<2.0.0
