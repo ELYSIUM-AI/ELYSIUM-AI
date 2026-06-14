@@ -18,16 +18,13 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from bs4 import BeautifulSoup
-from supabase import create_client
 
-# Поиск
 try:
     from duckduckgo_search import DDGS
     DDGS_AVAILABLE = True
 except ImportError:
     DDGS_AVAILABLE = False
 
-# Документы
 try:
     from pypdf import PdfReader
     PDF_AVAILABLE = True
@@ -44,7 +41,6 @@ try:
 except ImportError:
     XLSX_AVAILABLE = False
 
-# Голос
 try:
     import whisper
     WHISPER_AVAILABLE = True
@@ -52,11 +48,6 @@ except ImportError:
     WHISPER_AVAILABLE = False
 
 load_dotenv()
-
-# --- Supabase ---
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_KEY")
-supabase = create_client(supabase_url, supabase_key)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_KEY = os.getenv("GROQ_KEY")
@@ -71,12 +62,21 @@ logger = logging.getLogger(__name__)
 
 client = AsyncGroq(api_key=GROQ_KEY)
 
-# ====================== БАЗА ДАННЫХ (SQLite для фактов, профилей) ======================
+# ====================== SQLite БАЗА ДАННЫХ ======================
 DB_PATH = "elysium_data.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_facts (
             user_id INTEGER NOT NULL,
@@ -85,15 +85,16 @@ def init_db():
             PRIMARY KEY (user_id, fact_key)
         )
     """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON chat_history(user_id)")
     conn.commit()
     conn.close()
 
 init_db()
 
-# Кэш истории в памяти (только для быстродействия)
+# Кэш истории
 conversation_cache: Dict[int, List[Dict]] = {}
 
-# ChromaDB для долговременной памяти (векторная)
+# ChromaDB
 chroma_client = chromadb.PersistentClient(path="./elysium_memory")
 embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
 
@@ -103,7 +104,7 @@ def get_user_collection(user_id: int):
         embedding_function=embedding_fn
     )
 
-# ====================== ОБРАБОТКА ГОЛОСА ======================
+# ====================== ОСНОВНЫЕ ФУНКЦИИ ======================
 async def transcribe_voice(file_path: str) -> Optional[str]:
     if not WHISPER_AVAILABLE:
         return None
@@ -115,7 +116,6 @@ async def transcribe_voice(file_path: str) -> Optional[str]:
         logger.error(f"Whisper error: {e}")
         return None
 
-# ====================== ОБРАБОТКА ДОКУМЕНТОВ ======================
 async def extract_text_from_file(file_path: str, ext: str) -> str:
     try:
         if ext == "txt":
@@ -146,7 +146,6 @@ async def extract_text_from_file(file_path: str, ext: str) -> str:
         logger.error(f"File extraction error: {e}")
         return "Не удалось прочитать файл."
 
-# ====================== ПОИСК (улучшенный) ======================
 async def search_web(query: str) -> str:
     if DDGS_AVAILABLE:
         try:
@@ -163,7 +162,6 @@ async def search_web(query: str) -> str:
                     return answer
         except Exception as e:
             logger.error(f"DDGS error: {e}")
-    # Fallback на HTML DuckDuckGo
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
@@ -184,7 +182,6 @@ async def search_web(query: str) -> str:
         logger.error(f"Search fallback error: {e}")
     return "❌ Не удалось выполнить поиск."
 
-# ====================== ПОГОДА ======================
 async def get_weather(city: str) -> str:
     try:
         async with aiohttp.ClientSession() as session:
@@ -196,20 +193,16 @@ async def get_weather(city: str) -> str:
         pass
     return "Не удалось получить погоду."
 
-# ====================== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (2 попытки) ======================
 async def generate_image(prompt: str) -> Optional[bytes]:
-    # 1) Pollinations.ai
     try:
         encoded = urllib.parse.quote(prompt[:700])
         url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&enhance=true&nologo=true"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=50) as resp:
                 if resp.status == 200 and resp.content_type.startswith('image/'):
-                    logger.info("✅ Изображение от Pollinations")
                     return await resp.read()
     except Exception as e:
         logger.error(f"Pollinations error: {e}")
-    # 2) Fal.ai (если есть ключ)
     if FAL_KEY:
         try:
             fal_url = "https://fal.run/fal-ai/flux/schnell"
@@ -223,13 +216,11 @@ async def generate_image(prompt: str) -> Optional[bytes]:
                             img_url = data["images"][0]["url"]
                             async with session.get(img_url, timeout=30) as img_resp:
                                 if img_resp.status == 200 and img_resp.content_type.startswith('image/'):
-                                    logger.info("✅ Изображение от Fal.ai")
                                     return await img_resp.read()
         except Exception as e:
             logger.error(f"Fal.ai error: {e}")
     return None
 
-# ====================== FALLBACK OLLAMA ======================
 async def ask_ollama(prompt: str, system: str = "") -> str:
     try:
         async with aiohttp.ClientSession() as session:
@@ -247,54 +238,55 @@ async def ask_ollama(prompt: str, system: str = "") -> str:
                     return data.get("message", {}).get("content", "Ошибка Ollama")
     except Exception as e:
         logger.error(f"Ollama error: {e}")
-    return "❌ ИИ временно недоступен. Попробуйте позже."
+    return "❌ ИИ временно недоступен."
 
-# ====================== ОСНОВНОЙ AI (Groq + fallback) ======================
-_original_ask_ai_with_fallback = None  # заглушка
-
-async def ask_ai_with_fallback(messages: List[Dict], profile: Optional[Dict] = None, user_name: str = "Друг") -> str:
-    """Вызов Groq, при ошибке – Ollama. Если передан profile – добавляет личностный промпт."""
-    if profile is not None:
-        system = SYSTEM_PROMPT_TEMPLATE.format(
-            user_name=profile.get('name') or user_name,
-            city=profile.get('city', 'не указан'),
-            interests=', '.join(profile.get('interests', []))
-        )
-        new_messages = [{"role": "system", "content": system}] + messages
-    else:
-        new_messages = messages
+async def ask_ai_with_fallback(messages: List[Dict]) -> str:
     try:
         completion = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=new_messages,
+            messages=messages,
             max_tokens=1100,
             temperature=0.73
         )
         return completion.choices[0].message.content
     except Exception as e:
         logger.error(f"Groq error: {e}, switching to Ollama")
-        user_msg = next((m["content"] for m in reversed(new_messages) if m["role"] == "user"), "")
-        system_msg = next((m["content"] for m in new_messages if m["role"] == "system"), "")
-        return await ask_ollama(user_msg, system_msg)
+        user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        system = next((m["content"] for m in messages if m["role"] == "system"), "")
+        return await ask_ollama(user_msg, system)
 
-# ====================== РАБОТА С SUPABASE (история) ======================
-async def save_to_history(user_id, role, content):
-    supabase.table("chat_history").insert({
-        "user_id": str(user_id),
-        "role": role,
-        "content": content
-    }).execute()
+# ====================== SQLite ИСТОРИЯ ======================
+async def add_history(user_id: int, role: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO chat_history (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        (user_id, role, content, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    if user_id not in conversation_cache:
+        conversation_cache[user_id] = []
+    conversation_cache[user_id].append({"role": role, "content": content})
+    if len(conversation_cache[user_id]) > 20:
+        conversation_cache[user_id] = conversation_cache[user_id][-20:]
 
-async def get_history_supabase(user_id, limit=20):
-    response = supabase.table("chat_history") \
-        .select("role, content") \
-        .eq("user_id", str(user_id)) \
-        .order("created_at", desc=False) \
-        .limit(limit) \
-        .execute()
-    return response.data if response.data else []
+async def get_history(user_id: int, limit=20) -> List[Dict]:
+    if user_id in conversation_cache:
+        return conversation_cache[user_id][-limit:]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (user_id, limit)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    history = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+    conversation_cache[user_id] = history
+    return history
 
-# ====================== ПАМЯТЬ (ChromaDB) ======================
+# ====================== ПАМЯТЬ CHROMA ======================
 async def save_memory(user_id: int, text: str, role: str):
     try:
         collection = get_user_collection(user_id)
@@ -315,7 +307,7 @@ async def get_relevant_memory(user_id: int, query: str, n=3) -> List[str]:
         logger.error(f"Memory query error: {e}")
         return []
 
-# ====================== ПРОФИЛЬ И ФАКТЫ (SQLite) ======================
+# ====================== ПРОФИЛЬ И ФАКТЫ ======================
 USER_PROFILES_DIR = "user_profiles"
 os.makedirs(USER_PROFILES_DIR, exist_ok=True)
 
@@ -326,7 +318,6 @@ async def load_profile(user_id: int) -> Dict:
             profile = json.load(f)
     else:
         profile = {"name": None, "city": None, "interests": []}
-    # дополним фактами из БД
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT fact_key, fact_value FROM user_facts WHERE user_id = ?", (user_id,))
@@ -356,7 +347,6 @@ async def extract_facts(user_id: int, user_message: str, ai_response: str):
     import re
     profile = await load_profile(user_id)
     changed = False
-    # Имя
     name_match = re.search(r"меня зовут (\w+)", user_message, re.IGNORECASE)
     if not name_match:
         name_match = re.search(r"я (\w+)", user_message, re.IGNORECASE)
@@ -366,7 +356,6 @@ async def extract_facts(user_id: int, user_message: str, ai_response: str):
             profile["name"] = name
             await save_fact(user_id, "name", name)
             changed = True
-    # Город
     city_match = re.search(r"я живу в (\w+)", user_message, re.IGNORECASE)
     if city_match:
         city = city_match.group(1).capitalize()
@@ -374,7 +363,6 @@ async def extract_facts(user_id: int, user_message: str, ai_response: str):
             profile["city"] = city
             await save_fact(user_id, "city", city)
             changed = True
-    # Интересы
     for kw in ["люблю", "нравится", "интересуюсь", "увлекаюсь", "хобби"]:
         if kw in user_message.lower():
             parts = user_message.lower().split(kw)
@@ -387,41 +375,13 @@ async def extract_facts(user_id: int, user_message: str, ai_response: str):
     if changed:
         await save_profile(user_id, profile)
 
-# ====================== БЕЗОПАСНЫЙ MARKDOWN ======================
 def safe_markdown(text: str) -> str:
     special_chars = r'_*[]()~`>#+-=|{}.!'
     for ch in special_chars:
         text = text.replace(ch, f'\\{ch}')
     return text
 
-# ====================== ЛИЧНОСТНЫЙ ПРОМПТ ======================
-SYSTEM_PROMPT_TEMPLATE = """Ты — Elysium. Твой стиль: спокойный, прямой, уважительный. Без мата и лишней воды.
-Ты объясняешь сложные вещи простым языком. Прямой, честный, дружелюбный, с лёгким юмором.
-Говоришь как умный друг, который не боится сказать правду.
-
-Твои ценности: правда, полезность, юмор. Перед каждым ответом делай быстрый self-check:
-1) Это правда? (нет галлюцинаций)
-2) Это полезно?
-3) Это уважительно?
-
-Если не уверен — честно скажи "я не знаю" или "информация может быть устаревшей".
-
-Ты имеешь доступ к инструментам:
-- поиск в интернете (если пользователь просит «найди», «поищи», «что такое»)
-- цена криптовалют (если спрашивают цену биткоина, эфира и т.д.)
-- цена акций (если просят цену акции, например «акция Apple»)
-- новости (по запросу «новости»)
-- погода (по запросу «погода»)
-- генерация изображений (по словам «нарисуй», «создай фото»)
-
-Пользователь: {user_name}
-Город: {city}
-Интересы: {interests}
-
-Отвечай на языке пользователя. Будь максимально полезен.
-"""
-
-# ====================== НОВЫЕ ИНСТРУМЕНТЫ (крипта, акции) ======================
+# ====================== ИНСТРУМЕНТЫ ======================
 async def get_crypto_price(coin: str) -> str:
     try:
         coin_id = coin.lower().strip()
@@ -452,13 +412,38 @@ async def get_stock_price(symbol: str) -> str:
         pass
     return f"❌ Не удалось получить цену {symbol.upper()}"
 
-# ====================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ======================
+SYSTEM_PROMPT_TEMPLATE = """Ты — Elysium. Твой стиль: спокойный, прямой, уважительный. Без мата и лишней воды.
+Ты объясняешь сложные вещи простым языком. Прямой, честный, дружелюбный, с лёгким юмором.
+Говоришь как умный друг, который не боится сказать правду.
+
+Твои ценности: правда, полезность, юмор. Перед каждым ответом делай быстрый self-check:
+1) Это правда? (нет галлюцинаций)
+2) Это полезно?
+3) Это уважительно?
+
+Если не уверен — честно скажи "я не знаю" или "информация может быть устаревшей".
+
+Ты имеешь доступ к инструментам:
+- поиск в интернете (если пользователь просит «найди», «поищи», «что такое»)
+- цена криптовалют (если спрашивают цену биткоина, эфира и т.д.)
+- цена акций (если просят цену акции, например «акция Apple»)
+- новости (по запросу «новости»)
+- погода (по запросу «погода»)
+- генерация изображений (по словам «нарисуй», «создай фото»)
+
+Пользователь: {user_name}
+Город: {city}
+Интересы: {interests}
+
+Отвечай на языке пользователя. Будь максимально полезен.
+"""
+
+# ====================== ОБРАБОТЧИК ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name or "Друг"
     text = update.message.text.strip() if update.message.text else ""
 
-    # --- ГОЛОС ---
     if update.message.voice:
         voice_file = await update.message.voice.get_file()
         file_path = f"voice_{user_id}_{uuid.uuid4()}.ogg"
@@ -471,7 +456,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не удалось распознать голос.")
             return
 
-    # --- ФАЙЛЫ ---
     if update.message.document:
         doc = update.message.document
         ext = doc.file_name.split('.')[-1].lower()
@@ -492,7 +476,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     text_lower = text.lower()
 
-    # --- ГЕНЕРАЦИЯ ФОТО ---
+    # Генерация фото
     if any(k in text_lower for k in ['нарисуй', 'сгенерируй', 'картинку', 'фото', 'изображение']):
         msg = await update.message.reply_text("🎨 Генерирую изображение... ⏳")
         prompt = text
@@ -509,14 +493,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось сгенерировать изображение. Попробуйте другой запрос.")
         return
 
-    # --- ПОГОДА ---
+    # Погода
     if 'погода' in text_lower:
         city = text_lower.split('погода')[-1].strip() or "Москва"
         weather = await get_weather(city)
         await update.message.reply_text(weather)
         return
 
-    # --- КРИПТА (цена) ---
+    # Крипта
     if any(k in text_lower for k in ['цена биткоина', 'цена eth', 'цена sol', 'цена btc', 'сколько стоит', 'курс']):
         words = text_lower.split()
         coin = None
@@ -531,7 +515,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(price, parse_mode='Markdown')
             return
 
-    # --- АКЦИИ ---
+    # Акции
     if any(k in text_lower for k in ['акция', 'акции', 'stock', 'цена акции']):
         words = text_lower.split()
         for w in words:
@@ -541,7 +525,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(price, parse_mode='Markdown')
                 return
 
-    # --- ПОИСК / НОВОСТИ ---
+    # Поиск / новости
     if any(k in text_lower for k in ['найди', 'поищи', 'что такое', 'где', 'узнай', 'новости']):
         search_result = await search_web(text)
         await update.message.reply_text(search_result, parse_mode='Markdown', disable_web_page_preview=True)
@@ -549,35 +533,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"role": "system", "content": "Ты — Elysium, полезный помощник. Пользователь задал поисковый запрос. Результаты поиска уже показаны, но если хочешь, можешь дать краткий комментарий или резюме."},
             {"role": "user", "content": text}
         ]
-        profile = await load_profile(user_id)
-        answer = await ask_ai_with_fallback(messages, profile, user_name)
+        answer = await ask_ai_with_fallback(messages)
         await update.message.reply_text(answer, parse_mode='Markdown', disable_web_page_preview=True)
-        await save_to_history(user_id, "user", text)
-        await save_to_history(user_id, "assistant", answer)
+        await add_history(user_id, "user", text)
+        await add_history(user_id, "assistant", answer)
         await save_memory(user_id, text, "user")
         await save_memory(user_id, answer, "assistant")
         await extract_facts(user_id, text, answer)
         return
 
-    # --- ОБЫЧНЫЙ ЧАТ С ПАМЯТЬЮ ---
+    # Обычный чат
     profile = await load_profile(user_id)
     if profile.get("name") is None and user_name != "Друг":
         profile["name"] = user_name
         await save_profile(user_id, profile)
 
-    history = await get_history_supabase(user_id, limit=15)
+    history = await get_history(user_id, limit=15)
     memory = await get_relevant_memory(user_id, text, n=3)
 
+    system = SYSTEM_PROMPT_TEMPLATE.format(
+        user_name=profile.get('name') or user_name,
+        city=profile.get('city', 'не указан'),
+        interests=', '.join(profile.get('interests', []))
+    )
     messages = [
+        {"role": "system", "content": system},
         *history,
         *[{"role": "system", "content": f"Воспоминание: {m}"} for m in memory],
         {"role": "user", "content": text}
     ]
 
-    answer = await ask_ai_with_fallback(messages, profile, user_name)
+    answer = await ask_ai_with_fallback(messages)
 
-    await save_to_history(user_id, "user", text)
-    await save_to_history(user_id, "assistant", answer)
+    await add_history(user_id, "user", text)
+    await add_history(user_id, "assistant", answer)
     await save_memory(user_id, text, "user")
     await save_memory(user_id, answer, "assistant")
     await extract_facts(user_id, text, answer)
@@ -587,7 +576,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text(safe_markdown(answer))
 
-# ====================== СТАРТ ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🌟 *Elysium v6* — ИИ с характером и реальными инструментами\n\n"
@@ -605,7 +593,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
-    print("🚀 Elysium v6 (Supabase + личность + крипто-инструменты) запущен...")
+    print("🚀 Elysium v6 (SQLite + ChromaDB) запущен...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.Document.ALL, handle_message))
